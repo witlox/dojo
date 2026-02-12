@@ -1,4 +1,4 @@
-# Senior Meta-Cognitive Model Trainer
+# Dojo: Senior Meta-Cognitive Model Trainer
 
 ## Vision
 
