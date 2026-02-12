@@ -6,7 +6,7 @@ Dojo trains a local LLM to exhibit senior-engineer behavioral patterns using rei
 
 The training environment is [agile-agent-team](https://github.com/witlox/agile-agent-team) (AAT), a multi-agent software development simulation. AAT provides a public `src.rl` API with 28 exported symbols for RL integration. Dojo wraps this as a `gym.Env` and adds the reward attribution pipeline, training loop (PPO + LoRA), and evaluation harness.
 
-**Status**: Ready for implementation. All design docs and specs are complete. AAT's RL API (Phases A-C) is fully implemented.
+**Status**: Implemented. All core components are functional. AAT's RL API (Phases A-C) is fully implemented. Dojo's training pipeline runs end-to-end in mock mode; full integration requires AAT + vLLM.
 
 ## Architecture
 
@@ -23,7 +23,7 @@ See `docs/ARCHITECTURE.md` for full details.
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.9+
 - CUDA-capable GPU (for training and local model inference)
 - [agile-agent-team](https://github.com/witlox/agile-agent-team) cloned and installable
 - Anthropic API key (for judge evaluator — Claude Opus)
@@ -34,9 +34,9 @@ See `docs/ARCHITECTURE.md` for full details.
 ```bash
 git clone https://github.com/witlox/dojo
 cd dojo
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 
 # Install agile-agent-team as a dependency (for src.rl imports)
 pip install -e /path/to/agile-agent-team
@@ -123,177 +123,182 @@ composite_reward = (
 
 Weight schedule shifts from behavioral-heavy (Stage 1: 70/30) to outcome-heavy (Stage 4: 40/60). See `docs/REWARD_FUNCTION.md` and `specs/REWARD_SIGNALS.md`.
 
-## Implementation Plan
+## Implementation
 
-### Phase 1: Core Infrastructure
+### Environment Layer (`dojo/env/`)
 
-Build the foundational components that everything else depends on.
-
-#### 1.1 AAT Gym Wrapper (`src/env/aat_env.py`)
+#### `aat_env.py` — Gym Wrapper
 
 ```python
 # Key class: AATEnv(gym.Env)
 # Wraps: EpisodeRunner, PhaseRunner, ObservationExtractor, ActionExecutor
-# Provides: reset(), step(), render(), close()
-# Action space: Built from ACTION_SPACE_SPEC
-# Observation space: Built from ObservationExtractor output schema
+# Provides: reset(), step(), reset_async(), step_async(), run_full_episode()
+# Action space: Discrete(6) — no-op + 5 AAT environment control actions
+# Observation space: Dict with 8 fields (sprint_num, phase, num_agents, etc.)
+# AAT components are lazily initialized on first reset()
 ```
 
-Implementation steps:
-- Import AAT's `src.rl` API
-- Implement `gym.Env` interface wrapping `EpisodeRunner.run_episode()` and `PhaseRunner.run_phase()`
-- Build action/observation spaces from `ACTION_SPACE_SPEC` and `ObservationExtractor`
-- Register custom training candidate runtime via `register_runtime()`
-- Handle model injection via `ExperimentConfigBuilder`
-- Support both episode-level (full episodes) and phase-level (individual ceremonies) modes
+#### `spaces.py` — Gym Space Builders
 
-#### 1.2 Training Candidate Runtime (`src/runtime/candidate_runtime.py`)
+Defines `build_observation_space()`, `build_action_space()`, and converters:
+- `observation_to_gym()` — extracts structured observations from AAT state
+- `action_from_gym()` — maps Discrete(6) actions to AAT action dataclasses (InjectDisturbance, SwapAgentRole, ModifyBacklog, ModifyTeamComposition, AdjustSprintParams, or no-op)
+
+#### `prompt_renderer.py` — Observation-to-Text
+
+Converts structured gym observations into natural language prompts suitable for LLM input during episodes.
+
+### Runtime Layer (`dojo/runtime/`)
+
+#### `candidate_runtime.py` — Training Model Wrapper
 
 Custom AAT runtime that wraps the training candidate model:
-- Implements AAT's runtime interface (same as `vllm_runtime` or `anthropic_runtime`)
-- Forwards inference calls to the candidate model (local vLLM or direct)
+- Implements AAT's `AgentRuntime` interface
+- Forwards inference calls to vLLM endpoint (or mock mode)
 - Intercepts all model inputs/outputs for decision tracing
 - Supports LoRA adapter hot-swapping between episodes
+- Uses XML tool-calling protocol for multi-turn agentic execution
 
-#### 1.3 Backlog Generator (`src/data/backlog_generator.py`)
+#### `registration.py` — Runtime Registration
 
-Generates diverse synthetic backlogs for training episodes:
-- Varies domain (API, data pipeline, frontend, CLI, library, infra)
-- Varies language (Python, TypeScript, Go, Rust)
-- Varies ambiguity (0.1 fully specified to 0.9 one-line description)
-- Varies codebase context (greenfield, small brownfield, large brownfield)
-- Outputs AAT-compatible `backlog.yaml` files
+Registers `TrainingCandidateRuntime` with AAT's runtime factory so AAT accepts `"training_candidate"` as a runtime type.
 
-### Phase 2: Reward Attribution Pipeline
+### Reward Layer (`dojo/reward/`)
 
-#### 2.1 Judge Evaluator (`src/reward/judge_evaluator.py`)
+#### `judge_evaluator.py` — Claude Opus Behavioral Judge
 
-Claude Opus-based behavioral quality scorer:
 - Receives decision traces and behavioral rubric
 - Scores each decision on taxonomy dimensions
-- Returns score in [0, 1] with justification
-- Runs periodically (not every episode — expensive)
-- Calibrates against AAT's `BehavioralScorer` heuristic scores
+- Returns `JudgeResult` with score in [0, 1], justification, per-behavior scores, and flags
+- Runs periodically (configurable via `evaluate_every_n`)
+- Falls back to neutral score (0.5) when API unavailable
 
-#### 2.2 Composite Reward Calculator (`src/reward/composite_reward.py`)
+#### `composite_reward.py` — Combined Reward Calculator
 
-Combines all reward signals:
-- Wraps AAT's `RewardCalculator` for outcome signals
-- Wraps AAT's `BehavioralScorer` for fast behavioral signals
-- Adds judge evaluator scores (when available)
-- Applies efficiency penalty and phase bonus
-- Implements weight schedule per curriculum stage
+Combines all reward signals with stage-aware weights:
+- Outcome reward (from AAT's `RewardCalculator`)
+- Behavioral reward (heuristic from `BehavioralScorer`, or judge when available)
+- Efficiency penalty (penalizes excess actions vs. baseline)
+- Phase bonus (sparse bonus for correct phase transitions)
+- Weight schedule: Stage 1 (0.30/0.70) to Stage 4 (0.60/0.40)
 
-#### 2.3 Cross-Validation Monitor (`src/reward/calibration.py`)
+#### `calibration.py` — Reward Drift Detection
 
-Detects reward function drift:
-- Compares judge scores with outcome scores per batch
-- Flags disagreements (high behavioral + bad outcome, or vice versa)
-- Tracks reward distribution stability across training
-- Alerts when distributions shift beyond thresholds
+Detects disagreement between reward signals:
+- Flags "performative" episodes (high behavioral + bad outcome)
+- Flags "unconventional" episodes (bad behavioral + good outcome)
+- Computes Pearson correlations between signal pairs
+- Reports per-episode-type statistics
 
-### Phase 3: Training Loop
+### Training Layer (`dojo/training/`)
 
-#### 3.1 Trajectory Buffer (`src/training/trajectory_buffer.py`)
+#### `trajectory_buffer.py` — RL Data Collection
 
-Collects and stores episode trajectories:
-- Per-decision rewards from composite reward calculator
-- Episode metadata (type, stage, difficulty, scenario config)
-- Supports batched sampling for PPO updates
+Collects episode trajectories with per-decision rewards:
 - Implements GAE (Generalized Advantage Estimation)
+- Falls back to reward-to-go when value estimates unavailable
+- Supports batched sampling for PPO updates
 
-#### 3.2 PPO Trainer (`src/training/ppo_trainer.py`)
+#### `ppo_trainer.py` — PPO with LoRA/QLoRA
 
-LoRA/QLoRA adapter training:
-- PPO with clipped surrogate objective
-- LoRA rank 16-64 on behavioral layers only (preserve base coding capability)
+LoRA/QLoRA adapter training via HuggingFace TRL:
+- Default base model: `deepseek-coder-v2-lite-instruct`
+- LoRA rank 16 on q_proj/v_proj (behavioral layers only)
+- 4-bit QLoRA quantization via bitsandbytes
 - Per-stage adapter checkpoints
-- Learning rate schedule: 1e-5 to 5e-5 (conservative)
-- Batch size: 16-32 episodes
 
-#### 3.3 Curriculum Manager (`src/training/curriculum.py`)
+#### `curriculum.py` — Stage Progression Manager
 
-Manages stage progression:
-- Uses `ScenarioCatalog` to generate episode configs per stage
-- Tracks graduation criteria per stage (see `docs/TRAINING_PIPELINE.md`)
+Manages 4-stage curriculum:
+- Uses `ScenarioCatalog` to generate episode configs (falls back to RNG without AAT)
+- Tracks graduation criteria per stage
 - Advances to next stage when criteria met
-- Saves LoRA adapters at stage completion
-- Supports ablation (train subset of stages)
 
-### Phase 4: Evaluation Harness
+#### `observation_encoder.py` — Observation-to-Prompt Bridge
 
-#### 4.1 Solo Evaluation Environment (`src/eval/solo_env.py`)
+Converts gym observations into contextualized prompts:
+- Adds episode type context (2-3 sentences per episode type)
+- Optionally includes behavioral hints
+- Truncates to configurable max prompt length
 
-Standalone evaluation (no AAT dependency):
-- 5-phase protocol: elicitation, research, planning, execution, verification
-- Human proxy: scripted responses or fixed model
-- Task bank: 50-100 tasks spanning ambiguity, domain, codebase, complexity
+### Data Layer (`dojo/data/`)
 
-#### 4.2 Evaluation Metrics (`src/eval/metrics.py`)
+#### `backlog_generator.py` — Synthetic Backlog Generation
+
+Generates diverse synthetic backlogs for training:
+- 6 domains (API, data pipeline, frontend, CLI, library, infrastructure)
+- 4 languages (Python, TypeScript, Go, Rust)
+- Continuous ambiguity (0.1 fully specified to 0.9 one-liner)
+- 3 codebase contexts (greenfield, small brownfield, large brownfield)
+
+### Evaluation Layer (`dojo/eval/`)
+
+#### `solo_env.py` — Solo Evaluation Environment
+
+Standalone 5-phase evaluation (no AAT dependency):
+- Phases: elicitation, research, planning, execution, verification
+- `HumanProxy` provides scripted or generic responses
+- `SoloTask` loaded from YAML or constructed from dicts
+
+#### `metrics.py` — Transfer Scoring
 
 Primary metrics: elicitation quality, sufficiency calibration, research effectiveness, decomposition accuracy, self-correction rate, adaptation quality, intent match.
 
 Transfer score: `solo_metric / team_metric` per behavioral pattern. Target > 0.8.
 
-#### 4.3 Evaluation Runner (`src/eval/runner.py`)
+#### `runner.py` — Three-Cadence Evaluation
 
-Evaluation schedule:
-- Every 100 episodes: quick eval (10 tasks, primary metrics)
-- Every 500 episodes: full eval (50 tasks, all metrics)
-- Stage completion: comprehensive eval (100 tasks, transfer scores)
-- Post-training: full benchmark, ablation studies, regression checks
+- Quick eval (10 tasks) every 100 episodes
+- Full eval (50 tasks) every 500 episodes
+- Comprehensive eval (100 tasks) at stage completion, with transfer scores
 
-### Phase 5: Integration and Pipeline
+### Orchestration (`dojo/orchestrator.py`)
 
-#### 5.1 Training Orchestrator (`src/orchestrator.py`)
-
-End-to-end training pipeline:
-- Initializes AAT env, reward pipeline, trainer, evaluator
+End-to-end training pipeline coordinator:
 - Runs curriculum from Stage 1 through Stage 4
-- Handles checkpointing and fault recovery via `CheckpointManager`
-- Parallelizes episodes across GPU instances
-- Logs metrics (Prometheus, W&B, or similar)
+- Per-stage: generate batches, run episodes, periodic PPO updates and evaluations
+- Handles checkpointing via AAT's `CheckpointManager`
 
-#### 5.2 CLI Interface (`src/cli.py`)
+### CLI (`dojo/cli.py`)
 
 ```bash
 # Full training pipeline
-python -m src.cli train \
+dojo train \
     --base-model /path/to/base-model \
-    --aat-path /path/to/agile-agent-team \
     --output /path/to/output \
     --stages 1,2,3,4 \
     --judge-model claude-opus-4-6
 
 # Resume training from checkpoint
-python -m src.cli train \
+dojo train \
+    --base-model /path/to/base-model \
+    --output /path/to/output \
     --resume /path/to/output/checkpoint-latest
 
 # Evaluate a trained model
-python -m src.cli evaluate \
+dojo evaluate \
     --model /path/to/trained-model \
-    --adapter /path/to/lora-v4 \
-    --tasks /path/to/task-bank \
-    --output /path/to/eval-output
+    --output /path/to/eval-output \
+    --tasks /path/to/task-bank
 
 # Run a single episode for debugging
-python -m src.cli episode \
+dojo episode \
     --type elicitation \
     --stage 1 \
     --difficulty medium \
     --model /path/to/candidate \
-    --verbose
+    --mock --verbose
 ```
 
 ## Project Structure
 
 ```
-dojo/
+dojo/                                   # Repository root
 ├── CLAUDE.md                           # This file
 ├── README.md                           # Project overview
 ├── LICENSE                             # MIT
-├── requirements.txt                    # Python dependencies
-├── pyproject.toml                      # Tool config (black, ruff, mypy)
+├── pyproject.toml                      # Dependencies, tool config, entry points
+├── conftest.py                         # Pytest configuration
 ├── docs/
 │   ├── ARCHITECTURE.md                 # System architecture
 │   ├── DESIGN_RATIONALE.md             # Key decisions and reasoning
@@ -306,35 +311,48 @@ dojo/
 │   ├── TRAINING_EPISODES.md            # 13 episode types across 4 stages
 │   ├── REWARD_SIGNALS.md               # Per-behavior reward signals
 │   └── TRANSFER_ANALYSIS.md            # Team → solo transfer analysis
-└── src/
+├── dojo/                               # Source package
+│   ├── __init__.py
+│   ├── cli.py                          # CLI entry point (dojo command)
+│   ├── orchestrator.py                 # Training orchestrator
+│   ├── env/
+│   │   ├── __init__.py
+│   │   ├── aat_env.py                  # AATEnv(gym.Env) wrapper
+│   │   ├── spaces.py                   # Gym space builders + converters
+│   │   └── prompt_renderer.py          # Observation → text rendering
+│   ├── runtime/
+│   │   ├── __init__.py
+│   │   ├── candidate_runtime.py        # Training candidate AAT runtime
+│   │   └── registration.py             # Runtime factory registration
+│   ├── data/
+│   │   ├── __init__.py
+│   │   └── backlog_generator.py        # Synthetic backlog generation
+│   ├── reward/
+│   │   ├── __init__.py
+│   │   ├── judge_evaluator.py          # Claude Opus behavioral judge
+│   │   ├── composite_reward.py         # Combined reward calculator
+│   │   └── calibration.py              # Cross-validation monitor
+│   ├── training/
+│   │   ├── __init__.py
+│   │   ├── trajectory_buffer.py        # Trajectory collection + GAE
+│   │   ├── ppo_trainer.py              # PPO with LoRA/QLoRA
+│   │   ├── curriculum.py               # Stage progression manager
+│   │   └── observation_encoder.py      # Observation → prompt encoding
+│   └── eval/
+│       ├── __init__.py
+│       ├── solo_env.py                 # Solo evaluation environment
+│       ├── metrics.py                  # Transfer scores and metrics
+│       └── runner.py                   # Evaluation scheduler
+└── tests/                              # Test suite (mirrors dojo/ structure)
     ├── __init__.py
-    ├── cli.py                          # CLI entry point
-    ├── orchestrator.py                 # Training orchestrator
-    ├── env/
-    │   ├── __init__.py
-    │   └── aat_env.py                  # AATEnv(gym.Env) wrapper
-    ├── runtime/
-    │   ├── __init__.py
-    │   └── candidate_runtime.py        # Training candidate AAT runtime
-    ├── data/
-    │   ├── __init__.py
-    │   ├── backlog_generator.py        # Synthetic backlog generation
-    │   └── task_bank/                  # Evaluation task bank (YAML)
-    ├── reward/
-    │   ├── __init__.py
-    │   ├── judge_evaluator.py          # Claude Opus behavioral judge
-    │   ├── composite_reward.py         # Combined reward calculator
-    │   └── calibration.py              # Cross-validation monitor
-    ├── training/
-    │   ├── __init__.py
-    │   ├── trajectory_buffer.py        # Trajectory collection + GAE
-    │   ├── ppo_trainer.py              # PPO with LoRA/QLoRA
-    │   └── curriculum.py               # Stage progression manager
-    └── eval/
-        ├── __init__.py
-        ├── solo_env.py                 # Solo evaluation environment
-        ├── metrics.py                  # Transfer scores and metrics
-        └── runner.py                   # Evaluation scheduler
+    ├── test_cli.py
+    ├── test_orchestrator.py
+    ├── test_aat_import.py
+    ├── test_env/
+    ├── test_runtime/
+    ├── test_reward/
+    ├── test_training/
+    └── test_eval/
 ```
 
 ## AAT Integration Reference
@@ -396,10 +414,9 @@ python -m src.orchestrator.main --continue 2 --output /tmp/test --db-url mock://
 
 ## Code Conventions
 
-- Python 3.11+, async-first with asyncio
+- Python 3.9+, async-first with asyncio
 - Type hints everywhere (mypy strict)
-- Black formatting, Ruff linting
-- Pre-commit hooks enforced
+- Black formatting (100 char line length), Ruff linting (E, F, W, I, N, UP, B, A, SIM)
 - Tests: pytest + pytest-asyncio
 - No emojis in code or docs
 - Docstrings on public API only (not internal helpers)

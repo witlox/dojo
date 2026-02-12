@@ -64,44 +64,39 @@ from src.rl import (
 
 ### Dojo's `AATEnv(gym.Env)` Wrapper
 
-Dojo wraps AAT's RL API as a standard gym environment:
+Dojo wraps AAT's RL API as a standard gym environment (`dojo/env/aat_env.py`):
 
 ```python
 import gymnasium as gym
-from src.rl import (
-    EpisodeRunner, ScenarioCatalog, ObservationExtractor,
-    RewardCalculator, BehavioralScorer, ActionExecutor,
-    CheckpointManager, ExperimentConfigBuilder,
-)
+from dojo.env.spaces import build_action_space, build_observation_space
 
 class AATEnv(gym.Env):
-    """Gym wrapper around agile-agent-team's RL API."""
+    """Gym wrapper around agile-agent-team's RL API.
 
-    def __init__(self, stage: int, episode_type: str, difficulty: str):
-        self.config = ExperimentConfigBuilder() \
-            .with_stage(stage) \
-            .with_episode_type(episode_type) \
-            .build()
-        self.runner = EpisodeRunner(self.config)
-        self.catalog = ScenarioCatalog()
-        self.obs_extractor = ObservationExtractor()
-        self.reward_calc = RewardCalculator()
-        self.scorer = BehavioralScorer()
-        self.action_exec = ActionExecutor()
-        self.checkpoint_mgr = CheckpointManager()
+    AAT components are lazily initialized on first reset() to avoid
+    requiring src.rl at import time. Action space is Discrete(6),
+    observation space is a Dict with 8 structured fields.
+    """
 
-    def reset(self, seed=None):
-        scenario = self.catalog.generate(self.episode_type, self.difficulty)
-        # ... initialize episode
+    def __init__(self, config: EpisodeConfig, reward_weights=None):
+        self.action_space = build_action_space()       # Discrete(6)
+        self.observation_space = build_observation_space()  # Dict
+        self._initialized = False  # Lazy init
+
+    async def reset_async(self, seed=None, options=None):
+        self._ensure_initialized()  # Creates AAT components on first call
+        # ... generate scenario, extract observation
         return observation, info
 
-    def step(self, action):
-        result = self.action_exec.execute(action)
-        observation = self.obs_extractor.extract()
-        reward = self.reward_calc.compute(result)
-        score, behaviors = self.scorer.score(result.decision_traces)
+    async def step_async(self, action):
+        # Maps Discrete action to AAT action dataclass, runs phase
         return observation, reward, terminated, truncated, info
 ```
+
+Supporting modules:
+- `dojo/env/spaces.py` — builds gym spaces, converts between gym and AAT formats
+- `dojo/env/prompt_renderer.py` — renders observations as natural language for LLM input
+- `dojo/runtime/registration.py` — registers the training candidate runtime with AAT
 
 ### 1. Model Injection via ExperimentConfigBuilder
 
@@ -376,13 +371,21 @@ python -m src.orchestrator.main \
 
 AAT provides the simulation environment and low-level RL primitives. Dojo adds:
 
-| Dojo Component | What It Does | AAT Components Used |
-|---|---|---|
-| `AATEnv(gym.Env)` | Gym-compatible wrapper | EpisodeRunner, ObservationExtractor, ActionExecutor |
-| Curriculum Manager | Selects episode types, manages stage progression | ScenarioCatalog, ExperimentConfigBuilder |
-| Judge Evaluator | Large-model behavioral quality scoring | Decision traces from EpisodeResult |
-| Composite Reward | Combines outcome + behavioral + judge + efficiency | RewardCalculator, BehavioralScorer |
-| Training Loop (PPO) | LoRA/QLoRA adapter updates | Trajectory data from episodes |
-| Evaluation Harness | Solo deployment testing | Trained model (standalone, no AAT) |
-| Backlog Generator | Synthetic diverse backlogs | Backlog format from AAT |
-| Checkpoint Orchestrator | Cross-episode state management | CheckpointManager |
+| Dojo Component | Module | What It Does | AAT Components Used |
+|---|---|---|---|
+| `AATEnv(gym.Env)` | `dojo/env/aat_env.py` | Gym-compatible wrapper | EpisodeRunner, ObservationExtractor, ActionExecutor |
+| Gym Spaces | `dojo/env/spaces.py` | Action/observation space builders + converters | ACTION_SPACE_SPEC |
+| Prompt Renderer | `dojo/env/prompt_renderer.py` | Observation → natural language for LLM | Observation data |
+| Candidate Runtime | `dojo/runtime/candidate_runtime.py` | Wraps training model as AAT runtime | AgentRuntime interface |
+| Runtime Registration | `dojo/runtime/registration.py` | Registers candidate with AAT factory | register_runtime |
+| Curriculum Manager | `dojo/training/curriculum.py` | Episode selection, stage progression | ScenarioCatalog, ExperimentConfigBuilder |
+| Observation Encoder | `dojo/training/observation_encoder.py` | Observation → contextualized prompt | Observation data |
+| Judge Evaluator | `dojo/reward/judge_evaluator.py` | Large-model behavioral quality scoring | Decision traces from EpisodeResult |
+| Composite Reward | `dojo/reward/composite_reward.py` | Combines outcome + behavioral + efficiency | RewardCalculator, BehavioralScorer |
+| Calibration Monitor | `dojo/reward/calibration.py` | Detects reward signal drift | RewardCalculator, BehavioralScorer |
+| PPO Trainer | `dojo/training/ppo_trainer.py` | LoRA/QLoRA adapter updates | Trajectory data from episodes |
+| Trajectory Buffer | `dojo/training/trajectory_buffer.py` | Collects trajectories, computes GAE | Episode data |
+| Evaluation Harness | `dojo/eval/` | Solo deployment testing | Trained model (standalone, no AAT) |
+| Backlog Generator | `dojo/data/backlog_generator.py` | Synthetic diverse backlogs | Backlog format from AAT |
+| Orchestrator | `dojo/orchestrator.py` | End-to-end training pipeline | CheckpointManager |
+| CLI | `dojo/cli.py` | Command-line interface (train, evaluate, episode) | — |

@@ -48,60 +48,45 @@ Wraps the agile-agent-team system to expose it as a `gym.Env` with episode-level
 
 ```python
 import gymnasium as gym
-from src.rl import (
-    EpisodeRunner, EpisodeResult, ScenarioCatalog, ScenarioConfig,
-    ObservationExtractor, Observation, ActionExecutor, ACTION_SPACE_SPEC,
-    RewardCalculator, RewardWeights, BehavioralScorer,
-    CheckpointManager, ExperimentConfigBuilder, PhaseRunner,
-)
+from dojo.env.spaces import build_action_space, build_observation_space, action_from_gym, observation_to_gym
 
 class AATEnv(gym.Env):
-    """Gym wrapper around agile-agent-team's RL API."""
+    """Gym wrapper around agile-agent-team's RL API.
 
-    def __init__(self, stage: int, episode_type: str, difficulty: str = "medium"):
-        self.config = ExperimentConfigBuilder() \
-            .with_stage(stage) \
-            .with_episode_type(episode_type) \
-            .build()
-        self.runner = EpisodeRunner(self.config)
-        self.phase_runner = PhaseRunner(self.config)
-        self.catalog = ScenarioCatalog()
-        self.obs_extractor = ObservationExtractor()
-        self.reward_calc = RewardCalculator(RewardWeights.for_stage(stage))
-        self.scorer = BehavioralScorer()
-        self.action_exec = ActionExecutor()
-        self.checkpoint_mgr = CheckpointManager()
+    AAT components are lazily initialized on first reset() to avoid
+    importing src.rl at module load time.
+    """
 
-        # Gym spaces from AAT's ACTION_SPACE_SPEC
-        self.action_space = self._build_action_space(ACTION_SPACE_SPEC)
-        self.observation_space = self._build_obs_space()
+    def __init__(self, config: EpisodeConfig, reward_weights: Optional[Dict] = None):
+        # Gym spaces: Discrete(6) actions, Dict observation with 8 fields
+        self.action_space = build_action_space()       # Discrete(6): no-op + 5 AAT actions
+        self.observation_space = build_observation_space()  # Dict: sprint_num, phase, etc.
+        self._initialized = False  # AAT components created lazily
 
-    def reset(self, seed=None, options=None):
-        scenario = self.catalog.generate(self.episode_type, self.difficulty)
-        self._current_scenario = scenario
-        observation = self.obs_extractor.extract(self.runner)
+    async def reset_async(self, seed=None, options=None):
+        self._ensure_initialized()  # Lazy init of AAT components
+        scenario = self._catalog.generate_curriculum(...)
+        observation = observation_to_gym(self._obs_extractor.extract(...))
         return observation, {"scenario": scenario}
 
+    async def step_async(self, action):
+        aat_action = action_from_gym(action)  # Maps int to AAT action dataclass
+        phase_result = await self._phase_runner.run_phase(...)
+        observation = observation_to_gym(self._obs_extractor.extract(...))
+        reward = self._reward_calc.compute(...)
+        return observation, reward, terminated, truncated, info
+
+    def reset(self, seed=None, options=None):
+        """Sync wrapper around reset_async()."""
+        ...
+
     def step(self, action):
-        result = self.action_exec.execute(action)
-        observation = self.obs_extractor.extract(self.runner)
-        reward = self.reward_calc.compute(result)
-        score, behaviors = self.scorer.score(result.decision_traces)
-        info = {
-            "behavioral_score": score,
-            "behaviors_detected": behaviors,
-            "decision_traces": result.decision_traces,
-            "phase_results": result.phase_results,
-        }
-        return observation, reward, result.terminated, result.truncated, info
+        """Sync wrapper around step_async()."""
+        ...
 
-    async def run_episode(self, episode_type: str, difficulty: str) -> EpisodeResult:
-        """Run a complete episode using AAT's EpisodeRunner."""
-        return await self.runner.run_episode(episode_type=episode_type, difficulty=difficulty)
-
-    async def run_scenario(self, scenario: ScenarioConfig) -> EpisodeResult:
-        """Run a pre-generated scenario."""
-        return await self.runner.run_scenario(scenario)
+    async def run_full_episode(self) -> Dict:
+        """Run complete episode at once (bypasses step loop)."""
+        ...
 ```
 
 ### Model Injection
@@ -122,18 +107,25 @@ config = ExperimentConfigBuilder() \
 
 For behavioral training, the candidate model is placed in senior agent slots. The remaining agents run on fixed models (Claude Sonnet or vLLM) to provide a consistent environment.
 
-### Episode Types
+### Episode Types (13 Total)
 
-| Episode Type | Duration | Ceremony Phase | Primary Behaviors |
-|---|---|---|---|
-| `elicitation` | Short (~2 min) | Story refinement | Question quality, sufficiency detection |
-| `decomposition` | Short (~3 min) | Technical planning | Task breakdown, dependency identification |
-| `risk_assessment` | Short (~2 min) | Planning + checkpoint | Risk identification, mitigation planning |
-| `implementation` | Medium (~10 min) | Pairing session | Self-monitoring, checkpoint decisions |
-| `adaptation` | Medium (~5 min) | Disturbance response | Triage, replanning, communication |
-| `orientation` | Medium (~5 min) | Borrowing arrival | Rapid context gathering, convention detection |
-| `full_sprint` | Long (~20 min) | Full sprint lifecycle | Composed behaviors (evaluation only) |
-| `multi_sprint` | Long (~60 min) | Multiple sprints | Learning curves, meta-learning (evaluation only) |
+| ID | Episode Type | Stage | Duration | Primary Behaviors |
+|---|---|---|---|---|
+| E-1.1 | `elicitation` | 1 | ~2 min | B-01..B-04 (question quality, sufficiency) |
+| E-1.2 | `decomposition` | 1 | ~3 min | B-05..B-08 (task breakdown, dependencies) |
+| E-1.3 | `implementation` | 1 | ~10 min | B-09..B-11, B-25..B-26 (self-monitoring, scoping) |
+| E-1.4 | `self_monitoring` | 1 | ~3 min | B-09, B-10, B-12, B-30 (progress, stuck detection) |
+| E-1.5 | `research` | 1 | ~3 min | B-16, B-17, B-04 (search strategy, source eval) |
+| E-2.1 | `triage` | 2 | ~3 min | B-13, B-14, B-21 (severity, replanning) |
+| E-2.2 | `recovery` | 2 | ~5 min | B-10, B-11, B-14, B-15 (error diagnosis, recovery) |
+| E-2.3 | `scope_change` | 2 | ~3 min | B-02, B-13, B-14, B-25 (scope negotiation) |
+| E-3.1 | `borrowing_arrival` | 3 | ~5 min | B-18..B-20, B-22 (orientation, conventions) |
+| E-3.2 | `cross_team_dependency` | 3 | ~3 min | B-06, B-03, B-21 (cross-team deps) |
+| E-4.1 | `knowledge_handoff` | 4 | ~5 min | B-23, B-24 (documentation, transfer) |
+| E-4.2 | `onboarding_support` | 4 | ~5 min | B-20, B-07, B-22 (helping new members) |
+| E-4.3 | `compensation` | 4 | ~5 min | B-10, B-12, B-13, B-14 (covering gaps) |
+
+See `specs/TRAINING_EPISODES.md` for full episode specifications.
 
 ## Component 2: Reward Attribution Pipeline
 

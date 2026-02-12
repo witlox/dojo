@@ -12,13 +12,13 @@ Senior engineers aren't defined by their ability to write code. They're defined 
 
 The system has four major components:
 
-1. **Simulation Environment** — The [agile-agent-team](https://github.com/witlox/agile-agent-team) multi-agent simulation, used as a reinforcement learning gym via its public `src.rl` API. AAT exposes an `EpisodeRunner`, `PhaseRunner`, `ScenarioCatalog`, `ObservationExtractor`, `ActionExecutor`, and `CheckpointManager` — providing episode-level and phase-level control over sprints, behavioral trace extraction, and mid-episode state serialization. Dojo wraps these as a `gym.Env`.
+1. **Simulation Environment** (`dojo/env/`) — The [agile-agent-team](https://github.com/witlox/agile-agent-team) multi-agent simulation, used as a reinforcement learning gym via its public `src.rl` API. AAT exposes an `EpisodeRunner`, `PhaseRunner`, `ScenarioCatalog`, `ObservationExtractor`, `ActionExecutor`, and `CheckpointManager` — providing episode-level and phase-level control over sprints, behavioral trace extraction, and mid-episode state serialization. Dojo wraps these as a `gym.Env` with `Discrete(6)` action space and structured `Dict` observation space.
 
-2. **Reward Attribution Pipeline** — Consumes sprint artifacts and produces per-decision reward vectors. Uses AAT's `RewardCalculator` and `BehavioralScorer` for outcome-based and heuristic behavioral signals, supplemented by a large-model judge evaluator (Claude Opus) for nuanced behavioral quality assessment.
+2. **Reward Attribution Pipeline** (`dojo/reward/`) — Consumes sprint artifacts and produces per-decision reward vectors. Uses AAT's `RewardCalculator` and `BehavioralScorer` for outcome-based and heuristic behavioral signals, supplemented by a large-model judge evaluator (Claude Opus) for nuanced behavioral quality assessment. Includes a calibration monitor that detects reward signal drift.
 
-3. **Training Loop** — RL-based training (PPO with LoRA/QLoRA adapters) that updates model weights based on composite reward signals. The model learns *which meta-cognitive strategies lead to successful outcomes* through repeated exposure to consequence — the same mechanism by which human seniors develop judgment.
+3. **Training Loop** (`dojo/training/`) — RL-based training (PPO with LoRA/QLoRA adapters via HuggingFace TRL) that updates model weights based on composite reward signals. Default base model: `deepseek-coder-v2-lite-instruct`. The model learns *which meta-cognitive strategies lead to successful outcomes* through repeated exposure to consequence — the same mechanism by which human seniors develop judgment.
 
-4. **Evaluation Harness** — Tests whether behavioral patterns learned in the team environment transfer to solo deployment. Uses a 5-phase protocol (elicitation → research → planning → execution → verification) with transfer scoring per behavioral pattern.
+4. **Evaluation Harness** (`dojo/eval/`) — Tests whether behavioral patterns learned in the team environment transfer to solo deployment. Uses a 5-phase protocol (elicitation → research → planning → execution → verification) with transfer scoring per behavioral pattern. Three evaluation cadences: quick (every 100 episodes), full (every 500), comprehensive (at stage completion).
 
 ## Key Design Decisions
 
@@ -46,35 +46,22 @@ The system has four major components:
 | 3. Cross-team | Multi-team + agent borrowing | Rapid orientation, context-switching, convention respect | Stage 2 |
 | 4. Team change | Attrition + new hire scenarios | Knowledge transfer, onboarding, compensating for knowledge loss | Stage 3 |
 
-## Project Structure
+## Setup
 
-```
-dojo/
-├── README.md                           # This file
-├── CLAUDE.md                           # Development guide and build instructions
-├── docs/
-│   ├── DESIGN_RATIONALE.md             # Why this approach, key decisions
-│   ├── ARCHITECTURE.md                 # System architecture and components
-│   ├── TRAINING_PIPELINE.md            # End-to-end training pipeline
-│   ├── REWARD_FUNCTION.md              # Reward attribution design
-│   ├── EVALUATION_HARNESS.md           # Solo-deployment evaluation
-│   └── INTEGRATION_WITH_AAT.md         # How this connects to agile-agent-team
-└── specs/
-    ├── BEHAVIORAL_TAXONOMY.md          # 30 behavioral pattern specifications
-    ├── TRAINING_EPISODES.md            # Episode structure per curriculum stage
-    ├── REWARD_SIGNALS.md               # Measurable reward signals per behavior
-    └── TRANSFER_ANALYSIS.md            # Which team behaviors transfer to solo
+```bash
+git clone https://github.com/witlox/dojo
+cd dojo
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+
+# Install agile-agent-team for src.rl imports
+pip install -e /path/to/agile-agent-team
 ```
 
 ## Relationship to agile-agent-team
 
 This is a **separate project** that uses agile-agent-team as one component (the simulation environment). AAT now provides a public `src.rl` package with 28 exported symbols specifically designed for this integration — including `EpisodeRunner`, `PhaseRunner`, `ScenarioCatalog`, `ActionExecutor`, `BehavioralScorer`, `CheckpointManager`, and `RewardCalculator`. Integration points are documented in `docs/INTEGRATION_WITH_AAT.md`.
-
-## Status
-
-**Phase: Ready for Implementation**
-
-This repository contains the design documents, behavioral specifications, and architectural plans. The [agile-agent-team](https://github.com/witlox/agile-agent-team) simulation environment has completed its RL integration (Phases A-C), providing the full API surface needed. The next step is implementing the gym wrapper, reward attribution pipeline, training loop, and evaluation harness.
 
 ## License
 
