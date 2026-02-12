@@ -2,30 +2,123 @@
 
 ## Relationship
 
-This project uses [agile-agent-team](https://github.com/witlox/agile-agent-team) (AAT) as a simulation environment. AAT is not modified — this project wraps around it through its existing configuration and runtime interfaces.
+This project uses [agile-agent-team](https://github.com/witlox/agile-agent-team) (AAT) as a simulation environment. AAT provides a public `src.rl` package with a complete API surface designed specifically for this integration. Dojo wraps AAT's RL API as a `gym.Env`.
 
-## Integration Points
+## AAT RL API Surface
 
-### 1. Model Injection via Runtime Config
+AAT exports 28 symbols from `src.rl`:
 
-AAT already supports per-agent runtime and model assignment. The training pipeline injects the candidate model by generating a modified `config.yaml`:
+```python
+from src.rl import (
+    # Episode harness
+    EpisodeRunner,        # Runs complete episodes by type and difficulty
+    EpisodeResult,        # Episode outcome: rewards, traces, behavioral scores
 
-```yaml
-# Training candidate replaces a senior agent slot
-models:
-  agents:
-    ahmed_senior_dev_lead:
-      runtime: "local_vllm"
-      model: "/path/to/training-candidate-checkpoint-N"
-      tools: ["filesystem", "git", "bash"]
-      temperature: 0.7
-      max_tokens: 3072
-    
-    # All other agents remain fixed (consistent environment)
-    alex_senior_networking:
-      runtime: "anthropic"
-      model: "claude-sonnet-4-5"
-      # ...
+    # Scenario catalog
+    ScenarioCatalog,      # Generates scenario configs for each episode type
+    ScenarioConfig,       # Configuration for a single episode
+    EPISODE_TYPES,        # Registry of supported episode types
+
+    # Observation
+    ObservationExtractor, # Extracts gym-compatible observations from sprint state
+    Observation,          # Structured observation (team state, kanban, context)
+    AgentObservation,     # Per-agent observation slice
+
+    # Reward
+    RewardCalculator,     # Computes composite reward from artifacts
+    RewardSignal,         # Individual reward signal (source, value, weight)
+    RewardWeights,        # Weight configuration per curriculum stage
+
+    # Behavioral taxonomy
+    BehavioralScorer,     # Scores decision traces against 30 behavioral codes
+    BehavioralCode,       # Single behavioral code definition
+    BEHAVIORAL_CODES,     # Registry of all 30 codes (B-01 through B-30)
+
+    # Action space
+    ActionExecutor,       # Dispatches RL actions to SprintManager APIs
+    InjectDisturbance,    # Action: inject a disturbance mid-sprint
+    SwapAgentRole,        # Action: swap an agent's role
+    ModifyBacklog,        # Action: add/remove a story from backlog
+    ModifyTeamComposition,# Action: agent departure or backfill
+    AdjustSprintParams,   # Action: modify sprint duration or WIP limits
+    ACTION_SPACE_SPEC,    # Metadata dict for gym.Space construction
+
+    # Checkpointing
+    CheckpointManager,    # Saves/restores mid-episode state
+    Checkpoint,           # Serialized state snapshot
+
+    # Config
+    ExperimentConfigBuilder, # Programmatic experiment configuration
+    ExperimentConfig,        # Validated experiment config
+
+    # Phase runner
+    PhaseRunner,          # Runs individual sprint phases (ceremonies)
+    PhaseResult,          # Result of a single phase
+
+    # Runtime
+    register_runtime,     # Register custom model runtimes
+)
+```
+
+## Integration Architecture
+
+### Dojo's `AATEnv(gym.Env)` Wrapper
+
+Dojo wraps AAT's RL API as a standard gym environment:
+
+```python
+import gymnasium as gym
+from src.rl import (
+    EpisodeRunner, ScenarioCatalog, ObservationExtractor,
+    RewardCalculator, BehavioralScorer, ActionExecutor,
+    CheckpointManager, ExperimentConfigBuilder,
+)
+
+class AATEnv(gym.Env):
+    """Gym wrapper around agile-agent-team's RL API."""
+
+    def __init__(self, stage: int, episode_type: str, difficulty: str):
+        self.config = ExperimentConfigBuilder() \
+            .with_stage(stage) \
+            .with_episode_type(episode_type) \
+            .build()
+        self.runner = EpisodeRunner(self.config)
+        self.catalog = ScenarioCatalog()
+        self.obs_extractor = ObservationExtractor()
+        self.reward_calc = RewardCalculator()
+        self.scorer = BehavioralScorer()
+        self.action_exec = ActionExecutor()
+        self.checkpoint_mgr = CheckpointManager()
+
+    def reset(self, seed=None):
+        scenario = self.catalog.generate(self.episode_type, self.difficulty)
+        # ... initialize episode
+        return observation, info
+
+    def step(self, action):
+        result = self.action_exec.execute(action)
+        observation = self.obs_extractor.extract()
+        reward = self.reward_calc.compute(result)
+        score, behaviors = self.scorer.score(result.decision_traces)
+        return observation, reward, terminated, truncated, info
+```
+
+### 1. Model Injection via ExperimentConfigBuilder
+
+AAT's `ExperimentConfigBuilder` provides programmatic configuration. The training pipeline injects the candidate model into specific agent slots:
+
+```python
+from src.rl import ExperimentConfigBuilder, register_runtime
+
+# Register the training candidate as a custom runtime
+register_runtime("training_candidate", TrainingCandidateRuntime)
+
+config = ExperimentConfigBuilder() \
+    .with_runtime("training_candidate", model_path="/path/to/checkpoint-N") \
+    .with_agent_override("ahmed_senior_dev_lead", runtime="training_candidate") \
+    .with_disturbances(enabled=False) \
+    .with_teams(count=1) \
+    .build()
 ```
 
 The candidate model can be placed in different agent slots to train different behavioral contexts:
@@ -33,29 +126,145 @@ The candidate model can be placed in different agent slots to train different be
 - **Dev lead slot**: For triage, escalation, facilitation behaviors
 - **Borrowed agent slot**: For orientation and cross-team behaviors
 
-### 2. Episode Control via CLI
+All other agents run on fixed models (Claude Sonnet or vLLM) to provide a consistent environment.
 
-AAT's CLI provides episode control:
+### 2. Episode Control via EpisodeRunner
 
-```bash
-# Single sprint episode
-python -m src.orchestrator.main \
-  --config /tmp/episode-config.yaml \
-  --backlog /tmp/episode-backlog.yaml \
-  --sprints 1 \
-  --output /tmp/episode-output \
-  --db-url mock://
+AAT's `EpisodeRunner` provides both full-episode and scenario-based execution:
 
-# Multi-sprint episode (for evaluation)
-python -m src.orchestrator.main \
-  --sprints 5 \
-  --output /tmp/eval-output \
-  --db-url mock://
+```python
+from src.rl import EpisodeRunner, ScenarioCatalog, ScenarioConfig
+
+runner = EpisodeRunner(config)
+
+# Run by episode type and difficulty
+result = await runner.run_episode(episode_type="elicitation", difficulty="medium")
+
+# Or run from a pre-generated scenario
+catalog = ScenarioCatalog()
+scenario = catalog.generate(episode_type="triage", difficulty="hard")
+result = await runner.run_scenario(scenario)
+
+# Result contains everything needed for training
+print(result.reward)              # Composite reward signal
+print(result.behavioral_score)    # BehavioralScorer output
+print(result.behaviors_detected)  # List of detected behavioral codes
+print(result.decision_traces)     # Full decision trace for attribution
+print(result.phase_results)       # Per-phase breakdown
 ```
 
-The training pipeline generates per-episode config and backlog files, invokes AAT, and collects outputs.
+### 3. Phase-Level Control via PhaseRunner
 
-### 3. Artifact Extraction
+For phase-level training episodes (not full sprints), AAT's `PhaseRunner` provides direct control over individual sprint ceremonies:
+
+```python
+from src.rl import PhaseRunner, PhaseResult
+
+phase_runner = PhaseRunner(config)
+
+# Run individual phases
+refinement_result = await phase_runner.run_phase("story_refinement")
+planning_result = await phase_runner.run_phase("technical_planning")
+pairing_result = await phase_runner.run_phase("pairing_session")
+
+# Extract phase-level observations and rewards between phases
+```
+
+This enables the phase-level training episodes described in `specs/TRAINING_EPISODES.md` — short (2-10 minute) episodes targeting specific behavioral patterns rather than expensive full-sprint episodes.
+
+### 4. Action Space
+
+AAT defines 5 RL action types that Dojo uses between sprint phases to control the training environment:
+
+| Action | Parameters | Use Case |
+|---|---|---|
+| `InjectDisturbance` | disturbance_type, severity | Stage 2+ chaos injection |
+| `SwapAgentRole` | agent_id, target_role, proficiency | Profile swapping scenarios |
+| `ModifyBacklog` | add/remove story | Scope change episodes |
+| `ModifyTeamComposition` | depart/backfill agent | Stage 4 attrition/onboarding |
+| `AdjustSprintParams` | duration, wip_limits | Pressure variation |
+
+`ACTION_SPACE_SPEC` provides metadata for constructing `gym.Space` objects (categorical, continuous, agent_ref, role_ref, dict types).
+
+### 5. Observation Extraction
+
+AAT's `ObservationExtractor` produces structured observations compatible with gym:
+
+```python
+from src.rl import ObservationExtractor, Observation, AgentObservation
+
+extractor = ObservationExtractor()
+obs: Observation = extractor.extract(sprint_manager)
+
+# Observation includes:
+# - Team state (agents, roles, current assignments)
+# - Kanban state (cards, transitions, WIP)
+# - Sprint context (day, phase, velocity history)
+# - Per-agent observations (AgentObservation)
+```
+
+### 6. Reward Computation
+
+AAT provides both outcome-based and behavioral reward computation:
+
+```python
+from src.rl import RewardCalculator, RewardWeights, BehavioralScorer
+
+# Configure reward weights per curriculum stage
+weights = RewardWeights(
+    outcome_weight=0.3,    # Stage 1: behavioral-heavy
+    behavioral_weight=0.7,
+)
+
+reward_calc = RewardCalculator(weights)
+reward = reward_calc.compute(episode_result)
+
+# BehavioralScorer uses heuristic detection (no LLM calls)
+scorer = BehavioralScorer()
+score, detected_codes = scorer.score(decision_traces)
+# Returns (float, List[str]) — overall score and list of detected codes
+```
+
+The `BehavioralScorer` provides fast heuristic scoring during training. Dojo supplements this with the large-model judge evaluator (Claude Opus) for nuanced behavioral quality assessment — see `docs/REWARD_FUNCTION.md`.
+
+### 7. Behavioral Taxonomy Integration
+
+AAT implements all 30 behavioral codes from `specs/BEHAVIORAL_TAXONOMY.md`:
+
+```python
+from src.rl import BEHAVIORAL_CODES, BehavioralCode
+
+# Access any behavioral code definition
+b01 = BEHAVIORAL_CODES["B-01"]
+print(b01.name)              # "Ambiguity Detection"
+print(b01.stage)             # 1
+print(b01.category)          # "elicitation"
+print(b01.detection_heuristic)  # Function for keyword-based detection
+```
+
+The `BehavioralScorer` implements detection heuristics for all 30 codes using keyword matching against action content and context fields, plus action ordering checks (e.g., test-before-commit patterns).
+
+### 8. Checkpointing for Curriculum Replay
+
+AAT's `CheckpointManager` serializes mid-episode state for curriculum replay and debugging:
+
+```python
+from src.rl import CheckpointManager, Checkpoint
+
+mgr = CheckpointManager(checkpoint_dir="/tmp/checkpoints")
+
+# Save mid-episode state
+checkpoint = mgr.save(sprint_manager, episode_id="ep-001", sprint_num=1, phase="pairing")
+
+# Restore from checkpoint
+mgr.restore(sprint_manager, checkpoint_path)
+
+# List all checkpoints for an episode
+checkpoints = mgr.list_checkpoints(episode_id="ep-001")
+# Storage: {checkpoint_dir}/{episode_id}/s{sprint:02d}-{phase}.json
+```
+
+### 9. Artifact Extraction
 
 AAT produces structured artifacts that the reward pipeline consumes:
 
@@ -67,127 +276,113 @@ AAT produces structured artifacts that the reward pipeline consumes:
 | Final report | `<output>/final_report.json` | Velocity, coverage, features |
 | Generated code | `/tmp/agent-workspace/sprint-NN/*/` | Source, tests, git history |
 | Meta-learnings | `team_config/07_meta/meta_learnings.jsonl` | Agent learnings across sprints |
+| Decision traces | `<output>/sprint-NN/decision_traces.json` | Per-decision attribution data |
 
-### 4. Phase-Level Episode Extraction
+### 10. Multi-Team and Borrowing Episodes
 
-For phase-level training (not full sprints), the pipeline needs to intercept AAT at ceremony boundaries. Two approaches:
+AAT's multi-team mode is configured via `ExperimentConfigBuilder`:
 
-**Approach A: Subprocess with artifact parsing (simpler, recommended initially)**
-- Run AAT as a subprocess for a full sprint
-- Parse artifacts to extract phase-level traces
-- Attribute rewards to decisions within each phase
-- Limitation: cannot stop mid-sprint
-
-**Approach B: Library integration (more powerful, future)**
-- Import AAT's `SprintManager`, `StoryRefinementSession`, `TechnicalPlanningSession`, etc. as Python modules
-- Call individual ceremony methods directly
-- Full control over episode boundaries
-- Requires AAT to be installable as a package
-
-### 5. Multi-Team and Borrowing Episodes
-
-AAT's multi-team mode is accessed via the `teams:` config section:
-
-```yaml
-teams:
-  - id: "team-alpha"
-    agents: [ahmed_senior_dev_lead, alex_senior_networking, ...]
-  - id: "team-beta"
-    agents: [training_candidate_agent, marcus_mid_backend, ...]
-
-coordination:
-  enabled: true
-  max_borrows_per_sprint: 2
-  coordinators: [staff_engineer_01, enablement_lead_01]
+```python
+config = ExperimentConfigBuilder() \
+    .with_teams(count=2) \
+    .with_coordination(enabled=True, max_borrows=2) \
+    .with_agent_override("training_candidate", team="team-beta") \
+    .build()
 ```
 
-For borrowing episodes, the training candidate starts in one team and gets borrowed to another. The reward pipeline measures orientation speed and contribution quality in the receiving team.
+For borrowing episodes, the training candidate starts in one team and gets borrowed to another. The `EpisodeRunner` handles the borrowing lifecycle, and the reward pipeline measures orientation speed and contribution quality in the receiving team.
 
-### 6. Disturbance Configuration
+### 11. Disturbance Configuration
 
-AAT's disturbance engine is controlled via config:
+AAT's disturbance engine is configured per curriculum stage:
 
-```yaml
+```python
 # Stage 1: No disturbances
-disturbances:
-  enabled: false
+config = ExperimentConfigBuilder() \
+    .with_disturbances(enabled=False) \
+    .build()
 
 # Stage 2: Full disturbances
-disturbances:
-  enabled: true
-  frequencies:
-    dependency_breaks: 0.166
-    production_incident: 0.125
-    flaky_test: 0.25
-    scope_creep: 0.20
-    junior_misunderstanding: 0.33
-    architectural_debt_surfaces: 0.166
-    merge_conflict: 0.30
+config = ExperimentConfigBuilder() \
+    .with_disturbances(
+        enabled=True,
+        frequencies={
+            "dependency_breaks": 0.166,
+            "production_incident": 0.125,
+            "flaky_test": 0.25,
+            "scope_creep": 0.20,
+            "junior_misunderstanding": 0.33,
+            "architectural_debt_surfaces": 0.166,
+            "merge_conflict": 0.30,
+        }
+    ).build()
 ```
 
-The training pipeline varies disturbance frequencies across episodes for curriculum diversity.
+The `InjectDisturbance` action also allows Dojo to inject disturbances dynamically during episodes.
 
-### 7. Backlog Generation
+### 12. Backlog Generation
 
-Each episode needs a backlog. The training pipeline generates backlogs by:
-- Sampling from a curated task bank (see `specs/TRAINING_EPISODES.md`)
-- Varying ambiguity levels (fully specified → intentionally vague)
-- Varying domains (CRUD, data pipeline, frontend, library, distributed system)
-- Varying languages (Python, TypeScript, Go, Rust — using AAT's multi-language support)
+Each episode needs a backlog. The training pipeline generates backlogs and passes them via config:
 
-```yaml
-# Example generated backlog for an elicitation episode
-product:
-  name: "Training Episode Task"
-  languages: [python]
-
-stories:
-  - id: US-TRAIN-001
-    title: "Add caching to the API"  # Intentionally vague
-    description: "We need caching for better performance"
-    acceptance_criteria: []  # Intentionally empty — model must ask
-    story_points: 5
-    priority: 1
+```python
+config = ExperimentConfigBuilder() \
+    .with_backlog(backlog_path="/tmp/episode-backlog.yaml") \
+    .build()
 ```
+
+Backlogs are generated by sampling from a curated task bank (see `specs/TRAINING_EPISODES.md`), varying ambiguity levels, domains, languages, and codebase scale.
 
 ## AAT Features Used Per Training Stage
 
 | AAT Feature | Stage 1 | Stage 2 | Stage 3 | Stage 4 |
 |---|---|---|---|---|
-| Single team sprint | ✅ Primary | ✅ Primary | ✅ Evaluation | ✅ Evaluation |
-| Story refinement | ✅ Elicitation episodes | ✅ | ✅ | ✅ |
-| Technical planning | ✅ Decomposition episodes | ✅ | ✅ | ✅ |
-| Pairing sessions | ✅ Implementation episodes | ✅ | ✅ | ✅ |
-| Daily standups | ✅ Self-monitoring | ✅ | ✅ | ✅ |
-| Sprint review | ✅ Outcome signal | ✅ | ✅ | ✅ |
-| Retrospective | ✅ Meta-learning signal | ✅ | ✅ | ✅ |
+| EpisodeRunner | ✅ Primary | ✅ Primary | ✅ Primary | ✅ Primary |
+| PhaseRunner | ✅ Phase episodes | ✅ Phase episodes | ✅ Phase episodes | ✅ Phase episodes |
+| BehavioralScorer | ✅ All 30 codes | ✅ All 30 codes | ✅ All 30 codes | ✅ All 30 codes |
+| RewardCalculator | ✅ Outcome signals | ✅ Outcome signals | ✅ Outcome signals | ✅ Outcome signals |
+| CheckpointManager | ✅ State save/restore | ✅ State save/restore | ✅ State save/restore | ✅ State save/restore |
+| ActionExecutor | ❌ | ✅ Disturbances | ✅ Composition | ✅ Attrition |
+| ScenarioCatalog | ✅ Generates configs | ✅ Generates configs | ✅ Generates configs | ✅ Generates configs |
+| Story refinement | ✅ Elicitation eps | ✅ | ✅ | ✅ |
+| Technical planning | ✅ Decomposition eps | ✅ | ✅ | ✅ |
+| Pairing sessions | ✅ Implementation eps | ✅ | ✅ | ✅ |
 | Disturbances | ❌ | ✅ Primary | ✅ | ✅ |
-| Profile swapping | ❌ | ✅ Constrained | ✅ | ✅ |
 | Multi-team mode | ❌ | ❌ | ✅ Primary | ✅ |
 | Agent borrowing | ❌ | ❌ | ✅ Primary | ✅ |
-| Coordination loop | ❌ | ❌ | ✅ | ✅ |
-| Specialist consultant | ❌ | ✅ | ✅ | ✅ |
 | Turnover/attrition | ❌ | ❌ | ❌ | ✅ Primary |
-| Brownfield mode | ✅ Some episodes | ✅ | ✅ | ✅ |
-| Remote git | Optional | Optional | Optional | Optional |
+| Decision tracing | ✅ Attribution | ✅ Attribution | ✅ Attribution | ✅ Attribution |
 
-## AAT Modifications NOT Required
+## CLI Fallback
 
-The following are intentionally handled by the wrapper, not by modifying AAT:
+While library-level integration via `src.rl` is the primary approach, AAT can also be invoked via CLI for isolation or debugging:
 
-- **Decision tracing**: The wrapper intercepts model inputs/outputs at the runtime level
-- **Reward computation**: Computed from artifacts after episodes, not during
-- **Episode control**: Achieved via config generation and CLI invocation
-- **Curriculum management**: Entirely external to AAT
+```bash
+# Single sprint via CLI
+python -m src.orchestrator.main \
+  --config /tmp/episode-config.yaml \
+  --backlog /tmp/episode-backlog.yaml \
+  --sprints 1 \
+  --output /tmp/episode-output \
+  --db-url mock://
 
-## Potential AAT Enhancements (Optional, Future)
+# Continue from previous run
+python -m src.orchestrator.main \
+  --continue 2 \
+  --output /tmp/episode-output \
+  --db-url mock://
+```
 
-If the project matures, these AAT enhancements would improve integration:
+## What Dojo Builds on Top of AAT
 
-1. **Installable as a Python package** (`pip install agile-agent-team`) — enables library-level integration instead of subprocess
-2. **Event hooks** — callbacks at ceremony boundaries for phase-level episode control
-3. **Decision ID injection** — AAT assigns unique IDs to each agent decision for attribution
-4. **Structured trace export** — beyond artifacts, export full agent reasoning traces in a standard format
-5. **Attrition implementation** — currently described but not fully implemented; needed for Stage 4
+AAT provides the simulation environment and low-level RL primitives. Dojo adds:
 
-These are enhancements, not requirements. The project can proceed with subprocess-level integration.
+| Dojo Component | What It Does | AAT Components Used |
+|---|---|---|
+| `AATEnv(gym.Env)` | Gym-compatible wrapper | EpisodeRunner, ObservationExtractor, ActionExecutor |
+| Curriculum Manager | Selects episode types, manages stage progression | ScenarioCatalog, ExperimentConfigBuilder |
+| Judge Evaluator | Large-model behavioral quality scoring | Decision traces from EpisodeResult |
+| Composite Reward | Combines outcome + behavioral + judge + efficiency | RewardCalculator, BehavioralScorer |
+| Training Loop (PPO) | LoRA/QLoRA adapter updates | Trajectory data from episodes |
+| Evaluation Harness | Solo deployment testing | Trained model (standalone, no AAT) |
+| Backlog Generator | Synthetic diverse backlogs | Backlog format from AAT |
+| Checkpoint Orchestrator | Cross-episode state management | CheckpointManager |

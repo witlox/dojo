@@ -26,22 +26,32 @@ outcome_reward = weighted_sum(
 
 Each component is normalized to [0, 1].
 
-### 2. Behavioral Reward (from Judge Evaluator)
+### 2. Behavioral Reward (from BehavioralScorer + Judge Evaluator)
 
-A large model (Claude Opus) scores the reasoning trace against the behavioral taxonomy. The judge receives:
+Two levels of behavioral evaluation are combined:
+
+**Fast heuristic scoring (every episode)**: AAT's `BehavioralScorer` uses keyword matching and action ordering checks to detect all 30 behavioral codes without LLM calls:
+
+```python
+from src.rl import BehavioralScorer
+scorer = BehavioralScorer()
+heuristic_score, detected_codes = scorer.score(episode_result.decision_traces)
+```
+
+**Nuanced judge scoring (every N episodes)**: A large model (Claude Opus) scores the reasoning trace against the behavioral taxonomy. The judge receives:
 - The task context (story, codebase state, team state)
 - The model's full action sequence with reasoning
 - The behavioral rubric for the relevant patterns
 
 ```python
-behavioral_reward = judge_score(
+judge_reward = judge_score(
     trace=model_reasoning_trace,
     rubric=taxonomy_patterns_for_episode_type,
     context=task_and_environment_state
 )
 ```
 
-The judge returns a score in [0, 1] with justification. Justifications are logged for reward function debugging.
+The combined behavioral reward uses the heuristic score for most episodes, calibrated against judge scores periodically. Justifications are logged for reward function debugging.
 
 ### 3. Efficiency Penalty
 

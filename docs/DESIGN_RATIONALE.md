@@ -108,17 +108,17 @@ This follows the RLAIF (RL from AI Feedback) pattern but applied to engineering 
 
 The agile-agent-team environment provides a calibration mechanism: the behavioral evaluation (from the judge model) and the outcome evaluation (from sprint metrics) serve as two independent channels. A behavior that the judge rates highly but leads to poor sprint outcomes indicates the rubric needs updating. The two channels cross-validate.
 
-## Decision 7: Separate Project, External Pipeline
+## Decision 7: Separate Project, Library Integration
 
 ### The Decision
 
-Build this as a separate project that wraps around agile-agent-team, rather than extending agile-agent-team directly.
+Build this as a separate project that integrates with agile-agent-team via its public `src.rl` API, rather than extending agile-agent-team directly.
 
 ### The Reasoning
 
 The agile-agent-team is a research simulation for studying team dynamics. This project has a fundamentally different purpose — training a model. The concerns are different (episode structure, reward functions, training loops vs. sprint ceremonies, team culture, organizational dynamics).
 
-Integration points are well-defined: this project uses agile-agent-team as a callable environment, injects candidate models into agent slots, runs episodes, and extracts outcome data. The agile-agent-team system's existing model-swapping capability (different models per seniority level) already supports this.
+AAT now provides a dedicated RL integration package (`src.rl`) with 28 exported symbols — including `EpisodeRunner`, `PhaseRunner`, `ScenarioCatalog`, `ActionExecutor`, `BehavioralScorer`, `CheckpointManager`, and `RewardCalculator`. This clean API surface means Dojo can integrate at the library level (importing AAT modules directly) rather than using subprocess invocation and artifact parsing. The separation of concerns is maintained: AAT owns the simulation, Dojo owns the training pipeline.
 
 ## Open Questions
 

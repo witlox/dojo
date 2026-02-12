@@ -42,60 +42,85 @@ The Senior Meta-Cognitive Model Trainer is a pipeline that uses a multi-agent so
 
 ### Purpose
 
-Wraps the agile-agent-team system to expose it as a callable RL environment with episode-level granularity.
+Wraps the agile-agent-team system to expose it as a `gym.Env` with episode-level and phase-level granularity. Uses AAT's public `src.rl` API directly.
 
 ### Interface
 
 ```python
-class SimulationEnv:
-    """Gym-style wrapper around agile-agent-team."""
+import gymnasium as gym
+from src.rl import (
+    EpisodeRunner, EpisodeResult, ScenarioCatalog, ScenarioConfig,
+    ObservationExtractor, Observation, ActionExecutor, ACTION_SPACE_SPEC,
+    RewardCalculator, RewardWeights, BehavioralScorer,
+    CheckpointManager, ExperimentConfigBuilder, PhaseRunner,
+)
 
-    def reset(self, episode_config: EpisodeConfig) -> Observation:
-        """Initialize a new episode.
-        
-        Args:
-            episode_config: Specifies episode type (elicitation, decomposition,
-                          full_sprint, borrowing, etc.), difficulty level,
-                          backlog content, team composition, disturbance config.
-        
-        Returns:
-            Initial observation (task description, team context, available tools).
-        """
+class AATEnv(gym.Env):
+    """Gym wrapper around agile-agent-team's RL API."""
 
-    def step(self, action: Action) -> tuple[Observation, float, bool, dict]:
-        """Execute one action in the environment.
-        
-        Args:
-            action: Model's chosen action (ask_question, search, plan,
-                   execute_code, checkpoint, escalate, etc.)
-        
-        Returns:
-            observation: Updated state after action
-            reward: Immediate reward signal (sparse for most actions)
-            done: Whether episode is complete
-            info: Metadata (decision_id, phase, artifacts)
-        """
+    def __init__(self, stage: int, episode_type: str, difficulty: str = "medium"):
+        self.config = ExperimentConfigBuilder() \
+            .with_stage(stage) \
+            .with_episode_type(episode_type) \
+            .build()
+        self.runner = EpisodeRunner(self.config)
+        self.phase_runner = PhaseRunner(self.config)
+        self.catalog = ScenarioCatalog()
+        self.obs_extractor = ObservationExtractor()
+        self.reward_calc = RewardCalculator(RewardWeights.for_stage(stage))
+        self.scorer = BehavioralScorer()
+        self.action_exec = ActionExecutor()
+        self.checkpoint_mgr = CheckpointManager()
 
-    def extract_trajectory(self) -> Trajectory:
-        """Extract full behavioral trace with per-decision attribution."""
+        # Gym spaces from AAT's ACTION_SPACE_SPEC
+        self.action_space = self._build_action_space(ACTION_SPACE_SPEC)
+        self.observation_space = self._build_obs_space()
+
+    def reset(self, seed=None, options=None):
+        scenario = self.catalog.generate(self.episode_type, self.difficulty)
+        self._current_scenario = scenario
+        observation = self.obs_extractor.extract(self.runner)
+        return observation, {"scenario": scenario}
+
+    def step(self, action):
+        result = self.action_exec.execute(action)
+        observation = self.obs_extractor.extract(self.runner)
+        reward = self.reward_calc.compute(result)
+        score, behaviors = self.scorer.score(result.decision_traces)
+        info = {
+            "behavioral_score": score,
+            "behaviors_detected": behaviors,
+            "decision_traces": result.decision_traces,
+            "phase_results": result.phase_results,
+        }
+        return observation, reward, result.terminated, result.truncated, info
+
+    async def run_episode(self, episode_type: str, difficulty: str) -> EpisodeResult:
+        """Run a complete episode using AAT's EpisodeRunner."""
+        return await self.runner.run_episode(episode_type=episode_type, difficulty=difficulty)
+
+    async def run_scenario(self, scenario: ScenarioConfig) -> EpisodeResult:
+        """Run a pre-generated scenario."""
+        return await self.runner.run_scenario(scenario)
 ```
 
 ### Model Injection
 
-The wrapper injects the training candidate model into specific agent slots, leveraging the agile-agent-team's existing per-agent runtime configuration:
+The wrapper injects the training candidate model into specific agent slots using AAT's `ExperimentConfigBuilder` and `register_runtime`:
 
-```yaml
-# The training model replaces specific agent slots
-models:
-  agents:
-    ahmed_senior_dev_lead:
-      runtime: "training_candidate"    # ← injected model
-      model: "/path/to/candidate.gguf"
-    alex_senior_networking:
-      runtime: "anthropic"             # ← unchanged (environment agent)
+```python
+from src.rl import ExperimentConfigBuilder, register_runtime
+
+# Register custom runtime for the training candidate
+register_runtime("training_candidate", TrainingCandidateRuntime)
+
+config = ExperimentConfigBuilder() \
+    .with_runtime("training_candidate", model_path="/path/to/checkpoint-N") \
+    .with_agent_override("ahmed_senior_dev_lead", runtime="training_candidate") \
+    .build()
 ```
 
-For behavioral training, the candidate model is placed in senior agent slots. The remaining agents run on fixed models to provide a consistent environment.
+For behavioral training, the candidate model is placed in senior agent slots. The remaining agents run on fixed models (Claude Sonnet or vLLM) to provide a consistent environment.
 
 ### Episode Types
 
@@ -161,7 +186,7 @@ Sprint Artifacts                    Decision-Outcome Pairs
 
 ### Decision Tracer
 
-Every action the training model takes during an episode is logged with a unique `decision_id`. The tracer links these forward to outcomes:
+AAT's decision tracing (Phase A of the RL API) logs every action the training model takes during an episode with a unique `decision_id`. The tracer links these forward to outcomes:
 
 - Question asked during refinement → Did the answer change the implementation?
 - Research query executed → Was the retrieved information used in the code?
@@ -184,9 +209,12 @@ Uses agile-agent-team artifacts to compute outcome scores:
 
 ### Judge Evaluator
 
-A large model (Claude Opus) evaluates the behavioral quality of reasoning traces against the behavioral taxonomy (see `specs/BEHAVIORAL_TAXONOMY.md`). The judge receives the full trace and scores each decision on dimensions defined in the taxonomy.
+Two levels of behavioral evaluation are used:
 
-The judge evaluation and outcome evaluation serve as cross-validation:
+1. **AAT's `BehavioralScorer`**: Fast heuristic detection using keyword matching and action ordering checks. Runs during training for every episode. Detects all 30 behavioral codes without LLM calls.
+2. **Dojo's Judge Evaluator (Claude Opus)**: Nuanced behavioral quality scoring against the full taxonomy rubric. Runs periodically (every N episodes) for calibration and cross-validation.
+
+The judge receives the full trace and scores each decision on dimensions defined in the taxonomy. The judge evaluation and outcome evaluation serve as cross-validation:
 - High behavioral score + good outcome → Reinforce
 - High behavioral score + bad outcome → Rubric needs updating
 - Low behavioral score + good outcome → Lucky; don't reinforce strongly
@@ -225,11 +253,11 @@ Standard RL training infrastructure adapted for behavioral fine-tuning of langua
 ```
 For each curriculum stage:
     For each epoch:
-        1. Sample batch of episode configs (varying backlogs, teams, disturbances)
-        2. Run episodes through SimulationEnv with current model
-        3. Extract trajectories with decision-level attribution
-        4. Compute rewards via Reward Attribution Pipeline
-        5. Estimate advantages
+        1. Sample batch of episode configs via ScenarioCatalog
+        2. Run episodes through AATEnv (wrapping EpisodeRunner/PhaseRunner)
+        3. Extract trajectories from EpisodeResult.decision_traces
+        4. Compute rewards via RewardCalculator + BehavioralScorer + Judge Evaluator
+        5. Estimate advantages (GAE)
         6. Update LoRA adapters via PPO
         7. Evaluate on held-out solo scenarios (Evaluation Harness)
         8. If solo performance converges, advance to next stage
@@ -299,23 +327,24 @@ The key metric is the *transfer score* — the ratio of solo evaluation performa
 ### Training Episode
 
 ```
-1. Training Orchestrator selects episode config
+1. Curriculum Manager selects episode config via ScenarioCatalog
    (type: elicitation, stage: 2, difficulty: medium)
         │
-2. SimulationEnv.reset(config)
-   - Configures agile-agent-team
-   - Injects training model into agent slot
+2. AATEnv.reset(config)
+   - Configures agile-agent-team via ExperimentConfigBuilder
+   - Injects training model via register_runtime()
    - Initializes sprint context
         │
 3. Episode loop:
-   - SimulationEnv provides observation
+   - AATEnv provides observation via ObservationExtractor
    - Training model produces action
-   - SimulationEnv.step(action) → next observation + done flag
-   - Decision tracer logs (decision_id, action, context)
+   - AATEnv.step(action) → next observation + done flag
+   - AAT decision tracer logs (decision_id, action, context)
         │
-4. Episode completes
-   - SimulationEnv.extract_trajectory() → full trace
-   - Reward Attribution Pipeline scores trace
+4. Episode completes → EpisodeResult
+   - BehavioralScorer scores decision traces (fast heuristic)
+   - RewardCalculator computes outcome reward
+   - Judge Evaluator scores behavioral quality (periodic)
         │
 5. Trajectory + rewards → Training Loop buffer
         │
@@ -344,10 +373,11 @@ The key metric is the *transfer score* — the ratio of solo evaluation performa
 ### Episode Parallelism
 
 Multiple episodes can run concurrently using the agile-agent-team's async architecture:
-- Different episode configs on different GPU instances
+- Different episode configs on different GPU instances via `EpisodeRunner`
 - Trajectory collection is embarrassingly parallel
 - Only the PPO update step requires synchronization
+- `CheckpointManager` enables state save/restore for fault tolerance
 
 ### Curriculum Efficiency
 
-Phase-level episodes are 10-100x cheaper than full sprints. The bulk of training uses short episodes (2-10 minutes). Full sprint evaluations run periodically (every N training steps) to measure composition of learned behaviors.
+Phase-level episodes via AAT's `PhaseRunner` are 10-100x cheaper than full sprints. The bulk of training uses short episodes (2-10 minutes) targeting individual ceremonies. Full sprint evaluations via `EpisodeRunner` run periodically (every N training steps) to measure composition of learned behaviors.

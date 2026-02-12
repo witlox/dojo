@@ -131,8 +131,11 @@ Computed per behavioral pattern. A transfer score > 0.8 indicates good transfer.
 | Distilled model | Model trained via knowledge distillation from large model | Compares RL vs. distillation |
 | Large model (Opus/Sonnet) | Claude Opus on the same tasks | Ceiling performance |
 | Prompt-only | Base model with detailed senior behavior prompt | Measures fine-tuning vs. prompting |
+| AAT heuristic baseline | AAT's `BehavioralScorer` heuristic scores on untrained model | Measures training effect on detectable behaviors |
 
 The key comparison is **trained model vs. prompt-only baseline**. If the fine-tuned model significantly outperforms a carefully prompted base model, the behavioral RL training has value beyond what prompting can achieve.
+
+AAT's `BehavioralScorer` provides an additional automated baseline: comparing the number and quality of detected behavioral codes before and after training gives a fast, objective measure of behavioral improvement.
 
 ## Anti-Gaming Detection
 
