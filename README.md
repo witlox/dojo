@@ -66,3 +66,13 @@ This is a **separate project** that uses agile-agent-team as one component (the 
 ## License
 
 MIT
+
+## Reference
+```
+@software{dojo_trainer,
+  title = {Dojo: Senior Meta-Cognitive Model Trainer},
+  author = {Witlox},
+  year = {2026},
+  url = {https://github.com/witlox/dojo}
+}
+```
